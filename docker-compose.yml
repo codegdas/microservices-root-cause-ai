@@ -1,0 +1,52 @@
+services:
+
+  gateway:
+    build: ./services/gateway
+    ports:
+      - "5001:5000"
+    depends_on:
+      - order
+    networks:
+      - app-net
+
+  order:
+    build: ./services/order
+    depends_on:
+      - payment
+    networks:
+      - app-net
+
+  payment:
+    build: ./services/payment
+    depends_on:
+      - inventory
+    networks:
+      - app-net
+
+  inventory:
+    build: ./services/inventory
+    networks:
+      - app-net
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+    ports:
+      - "9200:9200"
+    networks:
+      - app-net
+
+  neo4j:
+    image: neo4j:5
+    environment:
+      - NEO4J_AUTH=neo4j/password
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    networks:
+      - app-net
+
+networks:
+  app-net:
