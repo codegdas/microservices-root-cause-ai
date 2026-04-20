@@ -1,8 +1,9 @@
 from neo4j import GraphDatabase
 from openai import OpenAI
+import os
 
-# OpenAI client (optional – fallback if fails)
-client = OpenAI()
+# Optional: OpenAI client (fallback if fails)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Neo4j connection
 driver = GraphDatabase.driver(
@@ -11,7 +12,9 @@ driver = GraphDatabase.driver(
 )
 
 
-# 🔍 Fetch data
+# =========================
+# 🔍 FETCH GRAPH DATA
+# =========================
 def fetch_graph_data():
     query = """
     MATCH (s:Service)-[:GENERATED]->(e:Event)
@@ -28,15 +31,19 @@ def fetch_graph_data():
     return data
 
 
-# 🧠 RCA logic
+# =========================
+# 🧠 ANALYZE ROOT CAUSE
+# =========================
 def analyze_root_cause(data):
 
+    # 🔥 Fallback logic (works without AI)
     def fallback():
         error_logs = [d for d in data if d["level"] == "ERROR"]
 
         if not error_logs:
             return None, None, "No failures detected"
 
+        # sort oldest first
         error_logs_sorted = sorted(error_logs, key=lambda x: x["timestamp"])
 
         services = []
@@ -59,12 +66,16 @@ Impacted Services:
 
         return root, chain, result_text
 
+    # 🔥 Try OpenAI
     try:
         prompt = f"""
-Analyze logs and find:
-1. Root cause
+You are an expert SRE.
+
+Analyze system logs and identify:
+1. Root cause service
 2. Failure chain
-3. Impact
+3. Impacted services
+4. Suggested fix
 
 Logs:
 {data}
@@ -76,14 +87,20 @@ Logs:
         )
 
         text = response.choices[0].message.content
-        return None, None, text
+
+        # NOTE: AI parsing is optional → fallback used for structure
+        root, chain, _ = fallback()
+
+        return root, chain, text
 
     except Exception as e:
         print("⚠️ OpenAI failed, using fallback:", e)
         return fallback()
 
 
-# 💾 Store Incident
+# =========================
+# 💾 STORE INCIDENT RCA
+# =========================
 def store_incident(root, chain, rca_text):
 
     if not root or not chain:
@@ -91,37 +108,39 @@ def store_incident(root, chain, rca_text):
         return
 
     query = """
-    CREATE (i:Incident {
-        uuid: randomUUID(),
-        rootCause: $root,
-        failureChain: $chain,
-        rca: $rca,
-        severity: "HIGH",
-        createdAt: timestamp(),
-        createdBy: "rca-agent"
-    })
+    MERGE (i:Incident {service: $root, status: "OPEN"})
+    ON CREATE SET
+        i.id = randomUUID(),
+        i.createdAt = timestamp(),
+        i.severity = "CRITICAL"
+
+    SET i.rca = $rca
+
     WITH i
 
     MATCH (s:Service {name: $root})
     MERGE (i)-[:ROOT_CAUSE]->(s)
 
     WITH i
+
     UNWIND $chain AS svc
     MATCH (s:Service {name: svc})
-    MERGE (i)-[:IMPACTED]->(s)
+    MERGE (i)-[:IMPACTS]->(s)
     """
 
     with driver.session() as session:
         session.run(query, {
             "root": root,
-            "chain": " → ".join(chain),
+            "chain": chain,
             "rca": rca_text
         })
 
-    print(f"🔥 Incident stored with RCA: root={root}")
+    print(f"🔥 Incident updated with RCA: root={root}")
 
 
-# 🚀 Runner
+# =========================
+# 🚀 MAIN RUNNER
+# =========================
 def run():
     print("🚀 Running RCA Agent...")
 
@@ -131,6 +150,7 @@ def run():
         print("❌ No data found")
         return
 
+    # Skip if no errors
     if not any(d["level"] == "ERROR" for d in data):
         print("✅ No errors — skipping RCA")
         return
@@ -140,7 +160,7 @@ def run():
     print("\n🤖 RCA RESULT:\n")
     print(result)
 
-    # ✅ FIXED
+    # Store in Neo4j
     store_incident(root, chain, result)
 
 
