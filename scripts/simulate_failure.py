@@ -1,15 +1,23 @@
 import requests
 import time
 import random
+import uuid
 
 GATEWAY_URL = "http://localhost:5001"
 
 def simulate():
     while True:
         try:
-            print("🚀 Sending request to gateway...")
+            # 🔥 Create ONE traceId per request flow
+            trace_id = str(uuid.uuid4())
 
-            res = requests.get(GATEWAY_URL)
+            print(f"\n🚀 Sending request | traceId={trace_id}")
+
+            # 👇 Send traceId as header
+            res = requests.get(
+                GATEWAY_URL,
+                headers={"X-Trace-Id": trace_id}
+            )
 
             if res.status_code == 200:
                 print("✅ Success")
@@ -19,7 +27,7 @@ def simulate():
         except Exception as e:
             print("🔥 Error:", e)
 
-        # random delay (simulate real traffic)
+        # random delay
         time.sleep(random.uniform(1, 3))
 
 

@@ -1,11 +1,10 @@
-from neo4j import GraphDatabase
-
-
 def transform_log(log):
     service = log["service"]
     level = log["level"]
     message = log["message"]
     timestamp = log["timestamp"]
+    trace_id = log.get("traceId", "unknown")
+    service_label = service.capitalize()
 
     calls_map = {
         "gateway": "order",
@@ -29,6 +28,19 @@ def transform_log(log):
 
     SET s.lastSeen = timestamp()
 
+    FOREACH (_ IN CASE WHEN $service_label = "Gateway" THEN [1] ELSE [] END |
+        SET s:Gateway
+    )
+    FOREACH (_ IN CASE WHEN $service_label = "Order" THEN [1] ELSE [] END |
+        SET s:Order
+    )
+    FOREACH (_ IN CASE WHEN $service_label = "Payment" THEN [1] ELSE [] END |
+        SET s:Payment
+    )
+    FOREACH (_ IN CASE WHEN $service_label = "Inventory" THEN [1] ELSE [] END |
+        SET s:Inventory
+    )
+
     // =======================
     // 2. EVENT
     // =======================
@@ -36,7 +48,8 @@ def transform_log(log):
         id: randomUUID(),
         timestamp: $timestamp,
         level: $level,
-        message: $message
+        message: $message,
+        traceId: $trace_id
     })
 
     MERGE (s)-[:GENERATED]->(e)
@@ -46,7 +59,7 @@ def transform_log(log):
     // =======================
     SET s.totalCount = s.totalCount + 1
 
-    WITH s
+    WITH s, e
 
     SET s.errorCount =
         CASE 
@@ -54,7 +67,7 @@ def transform_log(log):
             ELSE s.errorCount
         END
 
-    WITH s
+    WITH s, e
 
     SET s.errorRate =
         CASE
@@ -75,45 +88,66 @@ def transform_log(log):
         END
 
     // =======================
-    // 4. CALLS RELATIONSHIP
+    // 4. CALLS
     // =======================
-    WITH s
-    WHERE $next_service IS NOT NULL
+    WITH s, e
+    FOREACH (_ IN CASE WHEN $next_service IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (s2:Service {name: $next_service})
+        FOREACH (_ IN CASE WHEN $next_service = "gateway" THEN [1] ELSE [] END |
+            SET s2:Gateway
+        )
+        FOREACH (_ IN CASE WHEN $next_service = "order" THEN [1] ELSE [] END |
+            SET s2:Order
+        )
+        FOREACH (_ IN CASE WHEN $next_service = "payment" THEN [1] ELSE [] END |
+            SET s2:Payment
+        )
+        FOREACH (_ IN CASE WHEN $next_service = "inventory" THEN [1] ELSE [] END |
+            SET s2:Inventory
+        )
+        MERGE (s)-[:CALLS]->(s2)
+    )
 
-    MERGE (s2:Service {name: $next_service})
-    MERGE (s)-[:CALLS]->(s2)
+    WITH s, e
 
     // =======================
-    // 5. ALERT
+    // 5. ALERT (FROM EVENT)
     // =======================
-    WITH s
-    WHERE s.errorRate > 0.2
+    WITH s, e
+    WHERE $level = "ERROR"
 
-    MERGE (a:Alert {service: s.name, active: true})
-    ON CREATE SET
-        a.id = randomUUID(),
-        a.severity = "HIGH",
-        a.firedAt = timestamp(),
-        a.message = "High error rate"
+    CREATE (a:Alert {
+        id: randomUUID(),
+        severity: "HIGH",
+        message: $message,
+        firedAt: $timestamp
+    })
 
-    MERGE (s)-[:EMITS]->(a)
+    MERGE (e)-[:TRIGGERS]->(a)
+
+    WITH s, e, a
 
     // =======================
-    // 6. INCIDENT
+    // 6. INCIDENT (FROM ALERT)
     // =======================
-    WITH s
-    WHERE s.errorRate > 0.3
+    // Create an incident for each failing trace so the demo flow is reliable.
+    WHERE $trace_id <> "unknown"
 
-    MERGE (i:Incident {service: s.name, status: "OPEN"})
+    MERGE (i:Incident {traceId: $trace_id})
     ON CREATE SET
         i.id = randomUUID(),
-        i.createdAt = timestamp(),
+        i.createdAt = timestamp()
+    SET
+        i.updatedAt = timestamp(),
         i.severity = "CRITICAL",
+        i.status = "OPEN",
         i.rootCause = s.name
 
     MERGE (i)-[:ROOT_CAUSE]->(s)
+    MERGE (a)-[:ESCALATES_TO]->(i)
 
-    WITH s, i
+    WITH i, s
+
     MATCH (s)-[:CALLS*1..3]->(downstream:Service)
     MERGE (i)-[:IMPACTS]->(downstream)
 
@@ -125,6 +159,8 @@ def transform_log(log):
         "level": level,
         "message": message,
         "timestamp": timestamp,
+        "trace_id": trace_id,
+        "service_label": service_label,
         "next_service": next_service
     }
 

@@ -1,120 +1,66 @@
+# rca_agent.py
+
 from neo4j import GraphDatabase
-from openai import OpenAI
-import os
 
-# Optional: OpenAI client (fallback if fails)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Neo4j connection
 driver = GraphDatabase.driver(
     "bolt://localhost:7687",
     auth=("neo4j", "password")
 )
 
 
-# =========================
-# 🔍 FETCH GRAPH DATA
-# =========================
-def fetch_graph_data():
+def get_failed_traces():
     query = """
-    MATCH (s:Service)-[:GENERATED]->(e:Event)
-    RETURN s.name AS service, e.level AS level, e.message AS message, e.timestamp AS timestamp
-    ORDER BY e.timestamp DESC
-    LIMIT 50
+    MATCH (e:Event)
+    WHERE e.level = "ERROR" AND e.traceId IS NOT NULL
+    RETURN e.traceId AS traceId, count(*) AS errors
+    ORDER BY errors DESC
+    LIMIT 5
     """
 
     with driver.session() as session:
-        result = session.run(query)
-        data = [dict(r) for r in result]
-
-    print(f"📊 Fetched {len(data)} events from graph")
-    return data
+        return [r["traceId"] for r in session.run(query)]
 
 
-# =========================
-# 🧠 ANALYZE ROOT CAUSE
-# =========================
-def analyze_root_cause(data):
+def fetch_trace(trace_id):
+    query = """
+    MATCH (s:Service)-[:GENERATED]->(e:Event {traceId: $traceId})
+    RETURN s.name AS service, e.level AS level, e.timestamp AS ts
+    ORDER BY ts ASC
+    """
 
-    # 🔥 Fallback logic (works without AI)
-    def fallback():
-        error_logs = [d for d in data if d["level"] == "ERROR"]
+    with driver.session() as session:
+        return [dict(r) for r in session.run(query, {"traceId": trace_id})]
 
-        if not error_logs:
-            return None, None, "No failures detected"
 
-        # sort oldest first
-        error_logs_sorted = sorted(error_logs, key=lambda x: x["timestamp"])
+def analyze(data):
+    errors = [d for d in data if d["level"] == "ERROR"]
 
-        services = []
-        for log in error_logs_sorted:
-            if log["service"] not in services:
-                services.append(log["service"])
+    if not errors:
+        return None, None, "No failure"
 
-        root = services[0]
-        chain = services[::-1]
+    root = errors[-1]["service"]
+    chain = [d["service"] for d in data]
 
-        result_text = f"""
+    text = f"""
 Root Cause: {root}
 
-Failure Chain:
+Chain:
 {" → ".join(chain)}
 
-Impacted Services:
-{", ".join(services[1:])}
+Impact:
+{", ".join(set(chain) - {root})}
 """
 
-        return root, chain, result_text
-
-    # 🔥 Try OpenAI
-    try:
-        prompt = f"""
-You are an expert SRE.
-
-Analyze system logs and identify:
-1. Root cause service
-2. Failure chain
-3. Impacted services
-4. Suggested fix
-
-Logs:
-{data}
-"""
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        text = response.choices[0].message.content
-
-        # NOTE: AI parsing is optional → fallback used for structure
-        root, chain, _ = fallback()
-
-        return root, chain, text
-
-    except Exception as e:
-        print("⚠️ OpenAI failed, using fallback:", e)
-        return fallback()
+    return root, chain, text
 
 
-# =========================
-# 💾 STORE INCIDENT RCA
-# =========================
-def store_incident(root, chain, rca_text):
-
-    if not root or not chain:
-        print("⚠️ Skipping incident storage")
-        return
-
+def store(trace_id, root, chain, rca):
     query = """
-    MERGE (i:Incident {service: $root, status: "OPEN"})
-    ON CREATE SET
-        i.id = randomUUID(),
-        i.createdAt = timestamp(),
-        i.severity = "CRITICAL"
-
-    SET i.rca = $rca
+    MERGE (i:Incident {traceId: $traceId})
+    SET
+        i.rca = $rca,
+        i.rootCause = $root,
+        i.updatedAt = timestamp()
 
     WITH i
 
@@ -130,38 +76,24 @@ def store_incident(root, chain, rca_text):
 
     with driver.session() as session:
         session.run(query, {
+            "traceId": trace_id,
             "root": root,
             "chain": chain,
-            "rca": rca_text
+            "rca": rca
         })
 
-    print(f"🔥 Incident updated with RCA: root={root}")
 
-
-# =========================
-# 🚀 MAIN RUNNER
-# =========================
 def run():
-    print("🚀 Running RCA Agent...")
+    traces = get_failed_traces()
 
-    data = fetch_graph_data()
+    for t in traces:
+        data = fetch_trace(t)
+        root, chain, rca = analyze(data)
 
-    if not data:
-        print("❌ No data found")
-        return
+        print("\n🔥 RCA RESULT:\n", rca)
 
-    # Skip if no errors
-    if not any(d["level"] == "ERROR" for d in data):
-        print("✅ No errors — skipping RCA")
-        return
-
-    root, chain, result = analyze_root_cause(data)
-
-    print("\n🤖 RCA RESULT:\n")
-    print(result)
-
-    # Store in Neo4j
-    store_incident(root, chain, result)
+        if root:
+            store(t, root, chain, rca)
 
 
 if __name__ == "__main__":
