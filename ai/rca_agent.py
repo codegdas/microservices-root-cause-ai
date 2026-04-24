@@ -112,7 +112,15 @@ Evidence:
 {"; ".join(evidence)}
 """
 
-    return root, chain, text
+    return {
+        "root": root,
+        "chain": chain,
+        "impacts": impacts,
+        "reasoning": "; ".join(evidence),
+        "confidence": 0.7,
+        "source": "heuristic",
+        "rca": text,
+    }
 
 
 def llm_analyze(trace_id, data):
@@ -131,7 +139,8 @@ Return valid JSON with this exact shape:
 {{
   "rootCause": "service-name",
   "impactedServices": ["service-a", "service-b"],
-  "reasoning": "short explanation"
+  "reasoning": "short explanation",
+  "confidence": 0.91
 }}
 
 Rules:
@@ -153,6 +162,12 @@ Incident context:
         root = content["rootCause"]
         impacts = content.get("impactedServices", [])
         chain = [root] + [svc for svc in impacts if svc != root]
+        reasoning = content.get("reasoning", "").strip()
+        confidence = content.get("confidence", 0.85)
+
+        if not reasoning or reasoning in {"}", "}}", "{", "{{"} or len(reasoning) < 20:
+            return None
+
         text = f"""
 Root Cause: {root}
 
@@ -163,9 +178,17 @@ Impact:
 {", ".join(impacts)}
 
 Evidence:
-{content.get("reasoning", "LLM-generated RCA")}
+{reasoning}
 """
-        return root, chain, text
+        return {
+            "root": root,
+            "chain": chain,
+            "impacts": impacts,
+            "reasoning": reasoning,
+            "confidence": confidence,
+            "source": f"openai:{OPENAI_MODEL}",
+            "rca": text,
+        }
     except Exception as exc:
         print(f"⚠️ OpenAI RCA fallback: {exc}")
         return None
@@ -178,12 +201,15 @@ def analyze(trace_id, data):
     return heuristic_analyze(data)
 
 
-def store(trace_id, root, chain, rca):
+def store(trace_id, analysis):
     query = """
     MERGE (i:Incident {traceId: $traceId})
     SET
         i.rca = $rca,
         i.rootCause = $root,
+        i.reasoning = $reasoning,
+        i.confidence = $confidence,
+        i.rcaSource = $source,
         i.updatedAt = timestamp()
 
     WITH i
@@ -210,9 +236,12 @@ def store(trace_id, root, chain, rca):
     with driver.session() as session:
         session.run(query, {
             "traceId": trace_id,
-            "root": root,
-            "chain": chain,
-            "rca": rca
+            "root": analysis["root"],
+            "chain": analysis["chain"],
+            "rca": analysis["rca"],
+            "reasoning": analysis["reasoning"],
+            "confidence": analysis["confidence"],
+            "source": analysis["source"],
         })
 
 
@@ -221,13 +250,14 @@ def run():
 
     for t in traces:
         data = fetch_trace(t)
-        root, chain, rca = analyze(t, data)
+        analysis = analyze(t, data)
 
         print(f"\n🔥 TRACE: {t}")
-        print("\n🔥 RCA RESULT:\n", rca)
+        print(f"🔎 RCA SOURCE: {analysis['source']}")
+        print("\n🔥 RCA RESULT:\n", analysis["rca"])
 
-        if root:
-            store(t, root, chain, rca)
+        if analysis["root"]:
+            store(t, analysis)
 
 
 if __name__ == "__main__":
