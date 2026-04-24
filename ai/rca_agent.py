@@ -24,7 +24,14 @@ def get_failed_traces():
 def fetch_trace(trace_id):
     query = """
     MATCH (s:Service)-[:GENERATED]->(e:Event {traceId: $traceId})
+    OPTIONAL MATCH (d:Deployment)-[:RELATED_TO]->(e)
+    OPTIONAL MATCH (db:Database)-[:GENERATED]->(e)
     RETURN s.name AS service, e.level AS level, e.timestamp AS ts
+        , e.message AS message
+        , e.causeType AS causeType
+        , d.id AS deploymentId
+        , d.version AS deploymentVersion
+        , db.name AS databaseName
     ORDER BY ts ASC
     """
 
@@ -38,8 +45,26 @@ def analyze(data):
     if not errors:
         return None, None, "No failure"
 
-    root = errors[-1]["service"]
-    chain = [d["service"] for d in data]
+    prioritized = next(
+        (d for d in reversed(errors) if d.get("causeType") in {"deployment", "database"}),
+        errors[-1]
+    )
+
+    root = prioritized["service"]
+    chain = list(dict.fromkeys(d["service"] for d in data))
+    impacts = [svc for svc in chain if svc != root]
+    cause_type = prioritized.get("causeType")
+    evidence = []
+
+    if cause_type == "deployment" and prioritized.get("deploymentId"):
+        evidence.append(
+            f"Recent deployment {prioritized['deploymentId']} (version {prioritized.get('deploymentVersion', 'unknown')})"
+        )
+
+    if cause_type == "database" and prioritized.get("databaseName"):
+        evidence.append(f"Downstream database issue on {prioritized['databaseName']}")
+
+    evidence.append(f"Error event: {prioritized.get('message', 'unknown error')}")
 
     text = f"""
 Root Cause: {root}
@@ -48,7 +73,10 @@ Chain:
 {" → ".join(chain)}
 
 Impact:
-{", ".join(set(chain) - {root})}
+{", ".join(impacts)}
+
+Evidence:
+{"; ".join(evidence)}
 """
 
     return root, chain, text
@@ -63,6 +91,14 @@ def store(trace_id, root, chain, rca):
         i.updatedAt = timestamp()
 
     WITH i
+    OPTIONAL MATCH (i)-[oldRoot:ROOT_CAUSE]->(:Service)
+    DELETE oldRoot
+
+    WITH i
+    OPTIONAL MATCH (i)-[oldImpact:IMPACTS]->(:Service)
+    DELETE oldImpact
+
+    WITH i
 
     MATCH (s:Service {name: $root})
     MERGE (i)-[:ROOT_CAUSE]->(s)
@@ -70,6 +106,7 @@ def store(trace_id, root, chain, rca):
     WITH i
 
     UNWIND $chain AS svc
+    WITH i, svc WHERE svc <> $root
     MATCH (s:Service {name: svc})
     MERGE (i)-[:IMPACTS]->(s)
     """

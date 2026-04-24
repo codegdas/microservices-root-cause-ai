@@ -2,9 +2,14 @@ from flask import Flask, request
 from logger import get_logger
 import requests
 import random
+import os
+import time
 
 app = Flask(__name__)
 logger = get_logger("payment")
+PAYMENT_VERSION = os.getenv("PAYMENT_VERSION", "2.3.1")
+DEPLOYED_AT = float(os.getenv("PAYMENT_DEPLOYED_AT", str(time.time())))
+PAYMENT_DATABASE = os.getenv("PAYMENT_DATABASE", "payments-db")
 
 
 def get_trace_id():
@@ -16,9 +21,29 @@ def home():
     trace_id = get_trace_id()
 
     try:
-        # 🔥 simulate random failure (demo purpose)
-        if random.random() < 0.3:
-            logger.custom_log("ERROR", "Inventory service failed", trace_id)
+        failure_roll = random.random()
+
+        if failure_roll < 0.15:
+            logger.custom_log(
+                "ERROR",
+                "Payment failed after recent deployment",
+                trace_id,
+                causeType="deployment",
+                deploymentId=f"payment-{PAYMENT_VERSION}",
+                deploymentVersion=PAYMENT_VERSION,
+                deployedAt=DEPLOYED_AT
+            )
+            return "Failure", 500
+
+        if failure_roll < 0.30:
+            logger.custom_log(
+                "ERROR",
+                "Payment database connection timeout",
+                trace_id,
+                causeType="database",
+                databaseName=PAYMENT_DATABASE,
+                dependencyType="postgres"
+            )
             return "Failure", 500
 
         res = requests.get(

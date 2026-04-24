@@ -58,7 +58,7 @@ def get_logger(service_name):
     # ===============================
     # CUSTOM LOG FUNCTION
     # ===============================
-    def log(level, message, trace_id=None):
+    def log(level, message, trace_id=None, **extra_fields):
         log_entry = {
             "service": service_name,
             "level": level,
@@ -66,6 +66,7 @@ def get_logger(service_name):
             "traceId": trace_id if trace_id else "unknown",
             "timestamp": time.time()
         }
+        log_entry.update(extra_fields)
 
         # Print log
         logger.info(json.dumps(log_entry))

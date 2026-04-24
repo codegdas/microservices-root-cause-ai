@@ -4,7 +4,12 @@ def transform_log(log):
     message = log["message"]
     timestamp = log["timestamp"]
     trace_id = log.get("traceId", "unknown")
-    service_label = service.capitalize()
+    cause_type = log.get("causeType")
+    database_name = log.get("databaseName")
+    dependency_type = log.get("dependencyType")
+    deployment_id = log.get("deploymentId")
+    deployment_version = log.get("deploymentVersion")
+    deployed_at = log.get("deployedAt")
 
     calls_map = {
         "gateway": "order",
@@ -13,6 +18,8 @@ def transform_log(log):
     }
 
     next_service = calls_map.get(service)
+    event_key = f"{service}|{trace_id}|{timestamp}|{level}|{message}"
+    alert_key = f"{event_key}|alert"
 
     query = """
     // =======================
@@ -28,29 +35,22 @@ def transform_log(log):
 
     SET s.lastSeen = timestamp()
 
-    FOREACH (_ IN CASE WHEN $service_label = "Gateway" THEN [1] ELSE [] END |
-        SET s:Gateway
-    )
-    FOREACH (_ IN CASE WHEN $service_label = "Order" THEN [1] ELSE [] END |
-        SET s:Order
-    )
-    FOREACH (_ IN CASE WHEN $service_label = "Payment" THEN [1] ELSE [] END |
-        SET s:Payment
-    )
-    FOREACH (_ IN CASE WHEN $service_label = "Inventory" THEN [1] ELSE [] END |
-        SET s:Inventory
-    )
-
     // =======================
     // 2. EVENT
     // =======================
-    CREATE (e:Event {
-        id: randomUUID(),
-        timestamp: $timestamp,
-        level: $level,
-        message: $message,
-        traceId: $trace_id
-    })
+    MERGE (e:Event {id: $event_id})
+    ON CREATE SET
+        e.timestamp = $timestamp,
+        e.level = $level,
+        e.message = $message,
+        e.traceId = $trace_id,
+        e.causeType = $cause_type
+    SET
+        e.timestamp = $timestamp,
+        e.level = $level,
+        e.message = $message,
+        e.traceId = $trace_id,
+        e.causeType = $cause_type
 
     MERGE (s)-[:GENERATED]->(e)
 
@@ -93,42 +93,59 @@ def transform_log(log):
     WITH s, e
     FOREACH (_ IN CASE WHEN $next_service IS NOT NULL THEN [1] ELSE [] END |
         MERGE (s2:Service {name: $next_service})
-        FOREACH (_ IN CASE WHEN $next_service = "gateway" THEN [1] ELSE [] END |
-            SET s2:Gateway
-        )
-        FOREACH (_ IN CASE WHEN $next_service = "order" THEN [1] ELSE [] END |
-            SET s2:Order
-        )
-        FOREACH (_ IN CASE WHEN $next_service = "payment" THEN [1] ELSE [] END |
-            SET s2:Payment
-        )
-        FOREACH (_ IN CASE WHEN $next_service = "inventory" THEN [1] ELSE [] END |
-            SET s2:Inventory
-        )
         MERGE (s)-[:CALLS]->(s2)
     )
 
     WITH s, e
 
     // =======================
-    // 5. ALERT (FROM EVENT)
+    // 5. OPTIONAL DEPENDENCIES
+    // =======================
+    FOREACH (_ IN CASE WHEN $database_name IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (db:Database {name: $database_name})
+        ON CREATE SET db.type = coalesce($dependency_type, "database")
+        SET db.lastSeen = timestamp()
+        MERGE (s)-[:DEPENDS_ON]->(db)
+        MERGE (db)-[:GENERATED]->(e)
+    )
+
+    FOREACH (_ IN CASE WHEN $deployment_id IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (d:Deployment {id: $deployment_id})
+        ON CREATE SET
+            d.version = $deployment_version,
+            d.deployedAt = $deployed_at
+        SET
+            d.lastSeen = timestamp(),
+            d.version = coalesce($deployment_version, d.version),
+            d.deployedAt = coalesce($deployed_at, d.deployedAt)
+        MERGE (d)-[:DEPLOYED_TO]->(s)
+        MERGE (d)-[:RELATED_TO]->(e)
+    )
+
+    WITH s, e
+
+    // =======================
+    // 6. ALERT (FROM EVENT)
     // =======================
     WITH s, e
     WHERE $level = "ERROR"
 
-    CREATE (a:Alert {
-        id: randomUUID(),
-        severity: "HIGH",
-        message: $message,
-        firedAt: $timestamp
-    })
+    MERGE (a:Alert {id: $alert_id})
+    ON CREATE SET
+        a.severity = "HIGH",
+        a.message = $message,
+        a.firedAt = $timestamp
+    SET
+        a.severity = "HIGH",
+        a.message = $message,
+        a.firedAt = $timestamp
 
     MERGE (e)-[:TRIGGERS]->(a)
 
     WITH s, e, a
 
     // =======================
-    // 6. INCIDENT (FROM ALERT)
+    // 7. INCIDENT (FROM ALERT)
     // =======================
     // Create an incident for each failing trace so the demo flow is reliable.
     WHERE $trace_id <> "unknown"
@@ -141,15 +158,19 @@ def transform_log(log):
         i.updatedAt = timestamp(),
         i.severity = "CRITICAL",
         i.status = "OPEN",
-        i.rootCause = s.name
+        i.causeType = coalesce($cause_type, i.causeType)
 
-    MERGE (i)-[:ROOT_CAUSE]->(s)
     MERGE (a)-[:ESCALATES_TO]->(i)
 
-    WITH i, s
+    FOREACH (_ IN CASE WHEN $database_name IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (db:Database {name: $database_name})
+        MERGE (i)-[:RELATED_DATABASE]->(db)
+    )
 
-    MATCH (s)-[:CALLS*1..3]->(downstream:Service)
-    MERGE (i)-[:IMPACTS]->(downstream)
+    FOREACH (_ IN CASE WHEN $deployment_id IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (d:Deployment {id: $deployment_id})
+        MERGE (i)-[:RELATED_DEPLOYMENT]->(d)
+    )
 
     RETURN s
     """
@@ -160,8 +181,15 @@ def transform_log(log):
         "message": message,
         "timestamp": timestamp,
         "trace_id": trace_id,
-        "service_label": service_label,
-        "next_service": next_service
+        "event_id": event_key,
+        "alert_id": alert_key,
+        "next_service": next_service,
+        "cause_type": cause_type,
+        "database_name": database_name,
+        "dependency_type": dependency_type,
+        "deployment_id": deployment_id,
+        "deployment_version": deployment_version,
+        "deployed_at": deployed_at
     }
 
     return query, params

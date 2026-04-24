@@ -1,140 +1,115 @@
-🚀 Microservices Root Cause Analysis (AI + Graph)
+# Microservices Root Cause AI
 
-A Graph-powered AIOps system that detects failures across microservices, stores telemetry in Neo4j, and performs AI-driven Root Cause Analysis (RCA).
+A small demo project that simulates failures across microservices and performs graph-based root cause analysis using Neo4j.
 
-🧠 Architecture Overview
-User Traffic → Gateway → Order → Payment → Inventory
-↓
-Logs (JSON)
-↓
-Elasticsearch
-↓
-Neo4j Graph DB
-↓
-RCA Agent (AI)
-↓
-Incident + Root Cause + Impact
-🔥 Key Features
-📦 Microservices simulation (Gateway, Order, Payment, Inventory)
-📊 Centralized logging via Elasticsearch
-🧠 Graph-based modeling in Neo4j
-🚨 Automatic Alert & Incident creation
-🔍 Failure propagation tracking (CALLS graph)
-🤖 AI-powered Root Cause Analysis (RCA)
-🔗 Impact analysis across services
-🗂️ Project Structure
-.
-├── services/ # Microservices (gateway, order, payment, inventory)
-├── ingestion/ # ES → Neo4j ingestion pipeline
-├── ai/ # RCA Agent (AI + fallback logic)
-├── scripts/ # Simulation + automation scripts
-├── docker-compose.yml # Infrastructure setup
-└── README.md
-⚙️ Prerequisites
-Docker & Docker Compose
-Python 3.10+
-Neo4j Browser (optional: Bloom for visualization)
-🚀 Quick Start
-1️⃣ Start all services
-docker-compose up
-2️⃣ Generate traffic & failures
+Flow:
+
+`gateway -> order -> payment -> inventory`
+
+Logs are sent to Elasticsearch, ingested into Neo4j, and then analyzed by the RCA agent to identify:
+
+- root cause service
+- impacted services
+- related deployment or database context
+
+## Run The Project
+
+### 1. Start the services
+
+```bash
+docker-compose up --build
+```
+
+This starts:
+
+- gateway
+- order
+- payment
+- inventory
+- Elasticsearch
+- Neo4j
+
+### 2. Generate traffic and failures
+
+In a new terminal:
+
+```bash
 python scripts/simulate_failure.py
+```
 
-👉 Run for ~10–20 seconds, then stop (CTRL + C)
+Let it run for a few seconds, then stop it.
 
-3️⃣ Ingest logs into Neo4j
+### 3. Ingest logs into Neo4j
+
+```bash
 python -m ingestion.es_to_neo4j
-4️⃣ Run RCA Agent
+```
+
+### 4. Run root cause analysis
+
+```bash
 python -m ai.rca_agent
-⚡ One-Command Pipeline (Recommended)
-python -m scripts.auto_pipeline
+```
 
-👉 Runs:
+## Neo4j
 
-simulate → ingest → RCA → store in graph
-🧪 Verify in Neo4j
-
-Open 👉 http://localhost:7474
+Open [http://localhost:7474](http://localhost:7474)
 
 Login:
 
-neo4j / password
-🔍 Queries
-MATCH (s:Service) RETURN s;
-MATCH (a:Alert) RETURN a;
-MATCH (i:Incident) RETURN i;
-MATCH (i:Incident)-[r]->(s:Service) RETURN i, r, s;
-🔎 Failure Path Analysis
-MATCH path =
-(entry:Service)-[:CALLS*1..5]->(failing:Service)
+- username: `neo4j`
+- password: `password`
 
-WHERE failing.errorRate > 0.1
-AND entry.errorRate < 0.05
+## Useful Cypher Queries
 
-RETURN path
-🧠 RCA Output Example
-Root Cause: order
+### View incidents with root cause and impact
 
-Failure Chain:
-payment → gateway → order
+```cypher
+MATCH (i:Incident)-[:ROOT_CAUSE]->(root:Service)
+OPTIONAL MATCH (i)-[:IMPACTS]->(impacted:Service)
+RETURN
+  i.traceId,
+  root.name AS rootCause,
+  collect(DISTINCT impacted.name) AS impactedServices,
+  i.rca
+ORDER BY i.updatedAt DESC
+LIMIT 10
+```
 
-Impacted Services:
-gateway, payment
-📊 Graph Model
-Nodes
-Service
-Event
-Alert
-Incident
-Relationships
-(:Service)-[:GENERATED]->(:Event)
-(:Service)-[:CALLS]->(:Service)
-(:Service)-[:EMITS]->(:Alert)
-(:Incident)-[:ROOT_CAUSE]->(:Service)
-(:Incident)-[:IMPACTS]->(:Service)
-🎨 Visualization (Neo4j Bloom Recommended)
+### View one trace timeline
 
-Suggested styling:
+```cypher
+MATCH (s:Service)-[:GENERATED]->(e:Event {traceId: "YOUR_TRACE_ID"})
+RETURN s.name AS service, e.level AS level, e.message AS message, e.timestamp AS timestamp
+ORDER BY e.timestamp ASC
+```
 
-🔴 Root Cause → Red
-🟠 Impacted Services → Orange
-🟢 Healthy Services → Green
-🔥 Incident → Bold Red
-🧠 How RCA Works
+### View one incident with deployment and database context
 
-1. Logs are ingested into Neo4j
-2. Service metrics are computed:
-   errorRate = errorCount / totalCount
-3. Alerts & Incidents triggered based on thresholds
-4. RCA Agent analyzes graph:
-   Finds failure chain
-   Identifies root cause
-   Stores RCA in graph
-   ⚠️ Troubleshooting
-   ❌ No data in Neo4j
+```cypher
+MATCH (i:Incident {traceId: "YOUR_TRACE_ID"})-[:ROOT_CAUSE]->(root:Service)
+OPTIONAL MATCH (i)-[:IMPACTS]->(impacted:Service)
+OPTIONAL MATCH (i)-[:RELATED_DEPLOYMENT]->(d:Deployment)
+OPTIONAL MATCH (i)-[:RELATED_DATABASE]->(db:Database)
+RETURN
+  i.traceId,
+  root.name AS rootCause,
+  collect(DISTINCT impacted.name) AS impactedServices,
+  collect(DISTINCT d.id) AS deployments,
+  collect(DISTINCT db.name) AS databases,
+  i.rca
+```
 
-→ Run simulation again
+### View failure propagation path
 
-python scripts/simulate_failure.py
-❌ No incidents created
-
-→ Ensure enough ERROR logs exist
-
-❌ OpenAI quota error
-
-→ Fallback logic will still work (no AI required)
-
-🚀 Future Enhancements
-⏱️ Real-time streaming (Kafka)
-📈 Time-series anomaly detection
-🧠 LLM fine-tuned RCA reasoning
-📊 Dashboard (Grafana / React UI)
-🔔 Slack / Email alerting
-👨‍💻 Author
-
-Ganesh Das
-Neo4j Consultant | AI Enthusiast
-
-⭐ If you like this project
-
-Give it a ⭐ on GitHub and share!
+```cypher
+MATCH (s:Service)-[:GENERATED]->(e:Event {traceId: "YOUR_TRACE_ID"})
+MATCH path = (entry:Service)-[:CALLS*1..5]->(s)
+RETURN
+  e.id AS eventId,
+  s.name AS failedService,
+  [n IN nodes(path) | n.name] AS failureChain,
+  path
+ORDER BY length(path) DESC
+LIMIT 1
+```
