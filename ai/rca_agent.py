@@ -1,11 +1,21 @@
 # rca_agent.py
 
+import json
+import os
+
 from neo4j import GraphDatabase
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 driver = GraphDatabase.driver(
     "bolt://localhost:7687",
     auth=("neo4j", "password")
 )
+
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 def get_failed_traces():
@@ -39,7 +49,30 @@ def fetch_trace(trace_id):
         return [dict(r) for r in session.run(query, {"traceId": trace_id})]
 
 
-def analyze(data):
+def build_context(trace_id, data):
+    chain = list(dict.fromkeys(d["service"] for d in data))
+    timeline = [
+        {
+            "service": d["service"],
+            "level": d["level"],
+            "message": d.get("message"),
+            "timestamp": d.get("ts"),
+            "causeType": d.get("causeType"),
+            "deploymentId": d.get("deploymentId"),
+            "deploymentVersion": d.get("deploymentVersion"),
+            "databaseName": d.get("databaseName"),
+        }
+        for d in data
+    ]
+    return {
+        "traceId": trace_id,
+        "dependencyPath": ["gateway", "order", "payment", "inventory"],
+        "timeline": timeline,
+        "servicesInTrace": chain,
+    }
+
+
+def heuristic_analyze(data):
     errors = [d for d in data if d["level"] == "ERROR"]
 
     if not errors:
@@ -80,6 +113,69 @@ Evidence:
 """
 
     return root, chain, text
+
+
+def llm_analyze(trace_id, data):
+    if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
+        return None
+
+    context = build_context(trace_id, data)
+    client = OpenAI()
+    prompt = f"""
+You are an SRE root cause analysis assistant.
+
+Given the incident context below, identify exactly one root cause service.
+All other services should be treated as impacted services only.
+
+Return valid JSON with this exact shape:
+{{
+  "rootCause": "service-name",
+  "impactedServices": ["service-a", "service-b"],
+  "reasoning": "short explanation"
+}}
+
+Rules:
+- Pick exactly one root cause.
+- Prefer the deepest failing service in the dependency path.
+- Use deployment and database clues if present.
+- Do not include markdown fences.
+
+Incident context:
+{json.dumps(context, indent=2)}
+""".strip()
+
+    try:
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+        )
+        content = json.loads(response.output_text)
+        root = content["rootCause"]
+        impacts = content.get("impactedServices", [])
+        chain = [root] + [svc for svc in impacts if svc != root]
+        text = f"""
+Root Cause: {root}
+
+Chain:
+{" → ".join(chain)}
+
+Impact:
+{", ".join(impacts)}
+
+Evidence:
+{content.get("reasoning", "LLM-generated RCA")}
+"""
+        return root, chain, text
+    except Exception as exc:
+        print(f"⚠️ OpenAI RCA fallback: {exc}")
+        return None
+
+
+def analyze(trace_id, data):
+    llm_result = llm_analyze(trace_id, data)
+    if llm_result:
+        return llm_result
+    return heuristic_analyze(data)
 
 
 def store(trace_id, root, chain, rca):
@@ -125,8 +221,9 @@ def run():
 
     for t in traces:
         data = fetch_trace(t)
-        root, chain, rca = analyze(data)
+        root, chain, rca = analyze(t, data)
 
+        print(f"\n🔥 TRACE: {t}")
         print("\n🔥 RCA RESULT:\n", rca)
 
         if root:
